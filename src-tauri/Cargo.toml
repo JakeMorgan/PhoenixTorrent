@@ -1,6 +1,6 @@
 [package]
 name = "phoenix-torrent"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2021"
 description = "Phoenix Torrent — быстрый и красивый торрент-клиент"
 
