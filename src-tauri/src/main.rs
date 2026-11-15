@@ -70,6 +70,13 @@ fn bps(kbps: u32) -> Option<NonZeroU32> {
     NonZeroU32::new(kbps.saturating_mul(1024))
 }
 
+/// Занят ли порт другим процессом (TCP или UDP).
+fn port_busy(port: u16) -> bool {
+    std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_err()
+        || std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_err()
+        || std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_err()
+}
+
 struct Core {
     api: Api,
     /// Папка, с которой создана сессия (меняется только после перезапуска).
@@ -187,10 +194,16 @@ impl AppState {
             ..Default::default()
         };
 
-        // Если порт занят — пробуем случайный.
+        // Случайный порт пробуем, только если настроенный действительно занят;
+        // любую другую ошибку запуска показываем как есть.
         let session = match Session::new_with_opts(dir.clone(), opts(s.port)).await {
             Ok(session) => session,
-            Err(_) => Session::new_with_opts(dir.clone(), opts(0)).await?,
+            Err(err) if s.port != 0 && port_busy(s.port) => {
+                Session::new_with_opts(dir.clone(), opts(0))
+                    .await
+                    .map_err(|e2| e2.context(format!("порт {} занят ({err:#})", s.port)))?
+            }
+            Err(err) => return Err(err),
         };
         Ok(Core {
             api: Api::new(session, None),
@@ -408,6 +421,7 @@ async fn recheck(state: State<'_, AppState>, id: usize) -> R<()> {
         .map_err(|_| "Метаданные раздачи ещё не получены".to_string())?;
     let only_files = handle.only_files();
     let paused = handle.is_paused();
+    let hash = handle.info_hash().as_string();
     let folder = core.api.api_torrent_details(tid).map_err(e)?.output_folder;
     drop(handle);
 
@@ -418,19 +432,47 @@ async fn recheck(state: State<'_, AppState>, id: usize) -> R<()> {
     }
 
     core.api.api_torrent_action_forget(tid).await.map_err(e)?;
-    let opts = AddTorrentOptions {
+    let opts = |paused: bool| AddTorrentOptions {
         paused,
-        only_files,
-        output_folder: Some(folder),
+        only_files: only_files.clone(),
+        output_folder: Some(folder.clone()),
         overwrite: true,
         preferred_id: Some(id),
         ..Default::default()
     };
-    core.api
-        .api_add_torrent(AddTorrent::from_bytes(bytes), Some(opts))
-        .await
-        .map(|_| ())
-        .map_err(|err| format!("Раздача убрана из списка, но добавить её заново не удалось: {}", e(err)))
+
+    // Раздача уже убрана из сессии, поэтому за её возвращение боремся до конца:
+    // обычная попытка, повтор после паузы, затем добавление на паузе.
+    let mut last_err = String::new();
+    for (attempt, paused) in [paused, paused, true].into_iter().enumerate() {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        match core
+            .api
+            .api_add_torrent(AddTorrent::from_bytes(bytes.clone()), Some(opts(paused)))
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => last_err = e(err),
+        }
+    }
+
+    // Не получилось: сохраняем .torrent, чтобы раздачу можно было добавить вручную.
+    let dir = state.data_dir.join("recovered");
+    let file = dir.join(format!("{hash}.torrent"));
+    let saved = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(&file, &bytes))
+        .is_ok();
+    Err(if saved {
+        format!(
+            "Раздачу не удалось вернуть в список после проверки: {last_err}. \
+             Её .torrent сохранён в {} — добавьте его заново, указав папку {folder}",
+            file.display()
+        )
+    } else {
+        format!("Раздачу не удалось вернуть в список после проверки: {last_err}")
+    })
 }
 
 #[tauri::command]

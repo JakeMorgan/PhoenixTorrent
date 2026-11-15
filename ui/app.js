@@ -226,7 +226,10 @@ async function tick() {
     st.textContent = `Раздач: ${state.torrents.length}`;
     const livePeers = snap.session?.peers?.live;
     $('#st-peers').textContent = livePeers != null ? `Пиров: ${livePeers}` : '';
-    $('#st-port').textContent = snap.port ? `Порт: ${snap.port}` : '';
+    const wanted = snap.settings?.port;
+    $('#st-port').textContent = !snap.port ? ''
+      : wanted && wanted !== snap.port ? `Порт: ${snap.port} (${wanted} занят)`
+      : `Порт: ${snap.port}`;
     engineOk = true;
     renderList();
     drawGraph();
@@ -421,8 +424,32 @@ for (const b of $$('#filters button')) {
 $('#search').addEventListener('input', (ev) => { state.query = ev.target.value; renderList(); });
 
 // ---------- Модальные окна ----------
-function openModal(id) { closeModals(); $('#' + id).classList.remove('hidden'); }
-function closeModals() { $$('.modal').forEach((m) => m.classList.add('hidden')); }
+// Раздачи, ожидающие своей очереди на окно добавления (несколько перетащенных файлов,
+// ссылка из браузера, пока окно занято другой раздачей).
+const addQueue = [];
+let switchingModal = false;
+
+function openModal(id) {
+  switchingModal = true;
+  closeModals();
+  switchingModal = false;
+  $('#' + id).classList.remove('hidden');
+}
+function closeModals() {
+  const addWasOpen = !$('#m-add').classList.contains('hidden');
+  $$('.modal').forEach((m) => m.classList.add('hidden'));
+  // Окно добавления закрылось (добавили или отменили) — показываем следующую из очереди.
+  if (addWasOpen && !switchingModal && addQueue.length) {
+    const next = addQueue.shift();
+    setTimeout(() => openAdd(next), 0);
+  }
+}
+/// Открывает окно добавления или ставит раздачу в очередь, если оно уже занято.
+function requestAdd(source) {
+  if ($('#m-add').classList.contains('hidden')) { openAdd(source); return; }
+  addQueue.push(source);
+  toast(`В очереди на добавление: ${addQueue.length}`);
+}
 for (const m of $$('.modal')) {
   m.addEventListener('mousedown', (ev) => { if (ev.target === m) closeModals(); });
   $$('[data-close]', m).forEach((b) => b.addEventListener('click', closeModals));
@@ -558,7 +585,7 @@ document.addEventListener('paste', (ev) => {
   if (ev.target instanceof HTMLInputElement) return;
   const text = (ev.clipboardData?.getData('text') || '').trim();
   // Только то, что похоже на раздачу: случайная ссылка из буфера не должна скачиваться.
-  if (/^magnet:/i.test(text) || /^https?:\/\/\S+\.torrent(\?\S*)?$/i.test(text)) openAdd(text);
+  if (/^magnet:/i.test(text) || /^https?:\/\/\S+\.torrent(\?\S*)?$/i.test(text)) requestAdd(text);
 });
 
 // Перетаскивание .torrent-файлов.
@@ -568,8 +595,11 @@ listen('tauri://drag-drop', (ev) => {
   $('#drop').classList.add('hidden');
   const files = (ev.payload?.paths || []).filter((p) => p.toLowerCase().endsWith('.torrent'));
   if (!files.length) { toast('Это не .torrent-файл', true); return; }
-  openAdd(files[0]);
-  if (files.length > 1) toast(`Открыт первый файл из ${files.length} — остальные добавьте по одному`);
+  // Первый открывается сразу, остальные — по очереди после закрытия окна.
+  const busy = !$('#m-add').classList.contains('hidden');
+  addQueue.push(...files.slice(busy ? 0 : 1));
+  if (!busy) openAdd(files[0]);
+  if (addQueue.length) toast(`В очереди на добавление: ${addQueue.length}`);
 });
 
 // ---------- Настройки ----------
@@ -596,7 +626,7 @@ $('#set-assoc').addEventListener('click', async () => {
   refreshAssoc();
 });
 // Ссылка или файл, переданные при повторном запуске программы.
-listen('open-source', (ev) => { if (ev.payload) openAdd(ev.payload); });
+listen('open-source', (ev) => { if (ev.payload) requestAdd(ev.payload); });
 $('#set-pick').addEventListener('click', async () => {
   const p = await invoke('pick_folder').catch(fail);
   if (p) $('#set-dir').value = p;
