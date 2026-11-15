@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phoenix Torrent</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute">
+    <defs>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v14M6 12l6 6 6-6"/></symbol>
+      <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 20V6M6 12l6-6 6 6"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6h6l2 2h10v11H3z"/></symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+      <symbol id="i-all" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+      <symbol id="i-peers" viewBox="0 0 24 24"><circle cx="9" cy="9" r="3"/><path d="M3 19c0-3 3-5 6-5s6 2 6 5M16 6a3 3 0 010 6M18 14c2 1 3 3 3 5"/></symbol>
+    </defs>
+  </svg>
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo"><svg><use href="#i-down"/></svg></div>
+      <span>Phoenix</span>
+    </div>
+
+    <button class="btn primary wide" id="btn-add"><svg><use href="#i-plus"/></svg>Добавить</button>
+
+    <nav id="filters">
+      <button data-f="all" class="active"><svg><use href="#i-all"/></svg><span>Все</span><b></b></button>
+      <button data-f="downloading"><svg><use href="#i-down"/></svg><span>Загружаются</span><b></b></button>
+      <button data-f="seeding"><svg><use href="#i-up"/></svg><span>Раздаются</span><b></b></button>
+      <button data-f="done"><svg><use href="#i-check"/></svg><span>Завершённые</span><b></b></button>
+      <button data-f="paused"><svg><use href="#i-pause"/></svg><span>На паузе</span><b></b></button>
+    </nav>
+
+    <div class="spacer"></div>
+
+    <div class="speedcard">
+      <canvas id="graph" width="208" height="64"></canvas>
+      <div class="speedrow"><span class="dl"><svg><use href="#i-down"/></svg><b id="g-down">0 Б/с</b></span></div>
+      <div class="speedrow"><span class="ul"><svg><use href="#i-up"/></svg><b id="g-up">0 Б/с</b></span></div>
+    </div>
+    <button class="btn ghost wide" id="btn-settings"><svg><use href="#i-gear"/></svg>Настройки</button>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <h1 id="title">Все раздачи</h1>
+      <div class="search"><svg><use href="#i-search"/></svg><input id="search" placeholder="Поиск" spellcheck="false" /></div>
+    </header>
+
+    <section id="list" class="list"></section>
+
+    <div id="empty" class="empty hidden">
+      <div class="logo big"><svg><use href="#i-down"/></svg></div>
+      <h2>Пока пусто</h2>
+      <p>Перетащите сюда .torrent-файл, вставьте magnet-ссылку (Ctrl+V) или нажмите «Добавить».</p>
+    </div>
+
+    <section id="detail" class="detail hidden">
+      <div class="detail-head">
+        <div class="tabs">
+          <button data-t="files" class="active">Файлы</button>
+          <button data-t="peers">Пиры</button>
+          <button data-t="info">Сведения</button>
+        </div>
+        <button class="icon" id="detail-close" title="Закрыть"><svg><use href="#i-x"/></svg></button>
+      </div>
+      <div id="detail-body" class="detail-body"></div>
+    </section>
+
+    <footer class="statusbar">
+      <span id="st-engine" class="dot">Запуск движка…</span>
+      <span class="grow"></span>
+      <span id="st-peers"></span>
+      <span id="st-port"></span>
+    </footer>
+  </main>
+
+  <div id="drop" class="drop hidden"><div>Отпустите, чтобы добавить раздачу</div></div>
+
+  <!-- Добавление -->
+  <div class="modal hidden" id="m-add">
+    <div class="sheet">
+      <h2>Новая раздача</h2>
+      <div id="add-step1">
+        <label>Magnet-ссылка, URL или путь к .torrent</label>
+        <div class="row">
+          <input id="add-source" placeholder="magnet:?xt=urn:btih:…" spellcheck="false" />
+          <button class="btn" id="add-browse"><svg><use href="#i-folder"/></svg>Файл…</button>
+        </div>
+      </div>
+      <div id="add-step2" class="hidden">
+        <div class="add-name" id="add-name"></div>
+        <div class="add-meta" id="add-meta"></div>
+        <div class="filehead">
+          <label class="check"><input type="checkbox" id="add-all" checked /><span>Выбрать все</span></label>
+        </div>
+        <div class="filebox" id="add-files"></div>
+        <label>Сохранить в</label>
+        <div class="row">
+          <input id="add-folder" spellcheck="false" />
+          <button class="btn" id="add-pickfolder"><svg><use href="#i-folder"/></svg>Обзор…</button>
+        </div>
+        <label class="check"><input type="checkbox" id="add-remember" /><span>Запомнить эту папку по умолчанию</span></label>
+        <label class="check"><input type="checkbox" id="add-paused" /><span>Добавить на паузе</span></label>
+      </div>
+      <div class="error hidden" id="add-error"></div>
+      <div class="actions">
+        <button class="btn ghost" data-close>Отмена</button>
+        <button class="btn primary" id="add-next">Далее</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Удаление -->
+  <div class="modal hidden" id="m-remove">
+    <div class="sheet small">
+      <h2>Удалить раздачу?</h2>
+      <p id="rm-name" class="muted"></p>
+      <label class="check"><input type="checkbox" id="rm-files" /><span>Удалить также скачанные файлы</span></label>
+      <div class="actions">
+        <button class="btn ghost" data-close>Отмена</button>
+        <button class="btn danger" id="rm-ok">Удалить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Настройки -->
+  <div class="modal hidden" id="m-settings">
+    <div class="sheet small">
+      <h2>Настройки</h2>
+      <label>Папка загрузок</label>
+      <div class="row">
+        <input id="set-dir" spellcheck="false" />
+        <button class="btn" id="set-pick"><svg><use href="#i-folder"/></svg>Обзор…</button>
+      </div>
+      <div class="row two">
+        <div>
+          <label>Лимит загрузки, КБ/с</label>
+          <input id="set-down" type="number" min="0" placeholder="без лимита" />
+        </div>
+        <div>
+          <label>Лимит отдачи, КБ/с</label>
+          <input id="set-up" type="number" min="0" placeholder="без лимита" />
+        </div>
+      </div>
+      <p class="muted">0 или пусто — без ограничений. Новая папка применяется к новым раздачам.</p>
+      <label class="check"><input type="checkbox" id="set-tray" /><span>Сворачивать в трей при закрытии окна</span></label>
+      <div class="row">
+        <button class="btn" id="set-assoc">Открывать .torrent и magnet в Phoenix</button>
+      </div>
+      <p class="muted" id="set-assoc-state"></p>
+      <div class="error hidden" id="set-error"></div>
+      <div class="actions">
+        <button class="btn ghost" data-close>Отмена</button>
+        <button class="btn primary" id="set-save">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+  <script src="app.js"></script>
+</body>
+</html>

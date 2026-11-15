@@ -1,0 +1,44 @@
+name: Build
+
+# Каждый push в main и каждый pull request — проверочная сборка (exe лежит в артефактах запуска).
+# Push тега вида v1.2.3 — сборка и публикация релиза с PhoenixTorrent.exe.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release --locked --features custom-protocol
+
+      - name: Collect exe
+        run: Copy-Item src-tauri/target/release/phoenix-torrent.exe PhoenixTorrent.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoenixTorrent
+          path: PhoenixTorrent.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PhoenixTorrent.exe
+          generate_release_notes: true

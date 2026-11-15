@@ -1,0 +1,31 @@
+[package]
+name = "phoenix-torrent"
+version = "0.1.0"
+edition = "2021"
+description = "Phoenix Torrent — быстрый и красивый торрент-клиент"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+winreg = "0.55"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+librqbit = "9.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dirs = "6"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
