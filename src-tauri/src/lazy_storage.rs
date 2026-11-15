@@ -8,12 +8,15 @@
 use std::{
     any::TypeId,
     collections::HashMap,
-    sync::Arc,
     fs::{File, OpenOptions},
     io,
     os::windows::fs::FileExt,
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, RwLock, Weak,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -51,7 +54,7 @@ impl StorageFactory for LazyFsFactory {
         Ok(match root {
             Some(root) => Box::new(LazyFs {
                 root,
-                slots: RwLock::new(Vec::new()),
+                slots: RwLock::new(Arc::new(Vec::new())),
             }),
             // Раздача добавлена старой версией программы — папка неизвестна,
             // работаем через стандартное хранилище.
@@ -70,15 +73,80 @@ impl StorageFactory for LazyFsFactory {
     }
 }
 
+struct Opened {
+    file: File,
+    writable: bool,
+}
+
 struct Slot {
     path: PathBuf,
     padding: bool,
-    file: RwLock<Option<File>>,
+    file: RwLock<Option<Opened>>,
+    /// Время последней записи, мс от запуска программы.
+    last_write: AtomicU64,
 }
 
 pub struct LazyFs {
     root: PathBuf,
-    slots: RwLock<Vec<Slot>>,
+    slots: RwLock<Arc<Vec<Slot>>>,
+}
+
+// Пока файл открыт на запись, Windows не даёт другим программам запускать его
+// и открывать монопольно («файл занят другим процессом»). Поэтому файл, в который
+// какое-то время не писали, переоткрывается только для чтения. Этим занимается
+// один фоновый поток на всю программу.
+
+const WRITE_IDLE_MS: u64 = 5_000;
+const SWEEP_EVERY: Duration = Duration::from_secs(2);
+
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn registry() -> &'static Mutex<Vec<Weak<Vec<Slot>>>> {
+    static REGISTRY: OnceLock<Mutex<Vec<Weak<Vec<Slot>>>>> = OnceLock::new();
+    static SWEEPER: OnceLock<()> = OnceLock::new();
+    let reg = REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
+    SWEEPER.get_or_init(|| {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(SWEEP_EVERY);
+            let lists: Vec<Arc<Vec<Slot>>> = {
+                let mut reg = reg.lock().unwrap();
+                reg.retain(|w| w.strong_count() > 0);
+                reg.iter().filter_map(Weak::upgrade).collect()
+            };
+            for slot in lists.iter().flat_map(|l| l.iter()) {
+                slot.release_write_if_idle();
+            }
+        });
+    });
+    reg
+}
+
+impl Slot {
+    fn write_idle(&self) -> bool {
+        now_ms().saturating_sub(self.last_write.load(Ordering::Relaxed)) >= WRITE_IDLE_MS
+    }
+
+    fn release_write_if_idle(&self) {
+        let writable = matches!(self.file.read().unwrap().as_ref(), Some(o) if o.writable);
+        if !writable || !self.write_idle() {
+            return;
+        }
+        let mut guard = self.file.write().unwrap();
+        if !self.write_idle() {
+            return;
+        }
+        // Сначала закрываем дескриптор записи, потом открываем на чтение.
+        *guard = None;
+        if let Ok(file) = OpenOptions::new().read(true).open(&self.path) {
+            *guard = Some(Opened {
+                file,
+                writable: false,
+            });
+        }
+    }
 }
 
 /// Разреженный файл: запись в середину не заставляет Windows заполнять нулями всё до неё.
@@ -103,43 +171,65 @@ fn mark_sparse(f: &File) {
 }
 
 impl LazyFs {
+    fn slots(&self) -> Arc<Vec<Slot>> {
+        self.slots.read().unwrap().clone()
+    }
+
     /// Выполняет операцию над файлом, открывая его при необходимости.
-    /// `create = false` — только существующий файл (чтение), иначе файл создаётся.
+    /// `write = false` — только существующий файл, открывается на чтение;
+    /// `write = true` — файл создаётся при необходимости и открывается на запись.
     fn with_file<T>(
         &self,
         file_id: usize,
-        create: bool,
+        write: bool,
         op: impl FnOnce(&File) -> io::Result<T>,
     ) -> anyhow::Result<T> {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots();
         let slot = slots.get(file_id).context("no such file")?;
-        if let Some(f) = slot.file.read().unwrap().as_ref() {
-            return Ok(op(f)?);
+        if write {
+            slot.last_write.store(now_ms(), Ordering::Relaxed);
+        }
+        if let Some(o) = slot.file.read().unwrap().as_ref() {
+            if !write || o.writable {
+                return Ok(op(&o.file)?);
+            }
         }
         let mut guard = slot.file.write().unwrap();
-        if guard.is_none() {
-            if create {
+        let reopen = match guard.as_ref() {
+            Some(o) => write && !o.writable,
+            None => true,
+        };
+        if reopen {
+            *guard = None;
+            let file = if write {
                 if let Some(parent) = slot.path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-            }
-            let f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(create)
-                .truncate(false)
-                .open(&slot.path)
-                .with_context(|| format!("error opening {:?}", slot.path))?;
-            mark_sparse(&f);
-            *guard = Some(f);
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&slot.path)
+                    .with_context(|| format!("error opening {:?} for writing", slot.path))?;
+                mark_sparse(&f);
+                f
+            } else {
+                OpenOptions::new()
+                    .read(true)
+                    .open(&slot.path)
+                    .with_context(|| format!("error opening {:?}", slot.path))?
+            };
+            *guard = Some(Opened {
+                file,
+                writable: write,
+            });
         }
-        Ok(op(guard.as_ref().unwrap())?)
+        Ok(op(&guard.as_ref().unwrap().file)?)
     }
 
     fn is_padding(&self, file_id: usize) -> bool {
-        self.slots
-            .read()
-            .unwrap()
+        self.slots()
             .get(file_id)
             .map(|s| s.padding)
             .unwrap_or(false)
@@ -152,15 +242,19 @@ impl TorrentStorage for LazyFs {
         _shared: &ManagedTorrentShared,
         metadata: &TorrentMetadata,
     ) -> anyhow::Result<()> {
-        let slots = metadata
-            .file_infos
-            .iter()
-            .map(|fi| Slot {
-                path: self.root.join(&fi.relative_filename),
-                padding: fi.attrs.padding,
-                file: RwLock::new(None),
-            })
-            .collect();
+        let slots: Arc<Vec<Slot>> = Arc::new(
+            metadata
+                .file_infos
+                .iter()
+                .map(|fi| Slot {
+                    path: self.root.join(&fi.relative_filename),
+                    padding: fi.attrs.padding,
+                    file: RwLock::new(None),
+                    last_write: AtomicU64::new(0),
+                })
+                .collect(),
+        );
+        registry().lock().unwrap().push(Arc::downgrade(&slots));
         *self.slots.write().unwrap() = slots;
         Ok(())
     }
@@ -199,7 +293,7 @@ impl TorrentStorage for LazyFs {
     }
 
     fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
-        if let Some(slot) = self.slots.read().unwrap().get(file_id) {
+        if let Some(slot) = self.slots().get(file_id) {
             *slot.file.write().unwrap() = None;
         }
         match std::fs::remove_file(self.root.join(filename)) {
@@ -220,6 +314,13 @@ impl TorrentStorage for LazyFs {
         if self.is_padding(file_id) {
             return Ok(());
         }
+        // Длина уже верная (обычный случай при повторном запуске) — файл не трогаем
+        // и не открываем на запись.
+        if let Some(slot) = self.slots().get(file_id) {
+            if std::fs::metadata(&slot.path).map(|m| m.len()).ok() == Some(length) {
+                return Ok(());
+            }
+        }
         self.with_file(file_id, true, |f| f.set_len(length))
     }
 
@@ -234,14 +335,15 @@ impl TorrentStorage for LazyFs {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::os::windows::fs::OpenOptionsExt;
 
     use librqbit::{AddTorrent, AddTorrentOptions, DhtSessionConfig, Session, SessionOptions};
 
     use super::*;
 
-    /// Качает один файл из раздачи Sintel и проверяет, что невыбранные файлы,
-    /// в которые ничего не писалось, на диске не появились.
+    /// Качает один файл из раздачи Sintel и проверяет, что:
+    /// - невыбранные файлы, в которые ничего не писалось, на диске не появились;
+    /// - скачанный файл после загрузки не остаётся открытым на запись.
     /// Запуск: cargo test -- --ignored --nocapture
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "нужна сеть"]
@@ -311,6 +413,20 @@ mod tests {
         assert!(created < files.len(), "созданы все файлы раздачи");
         let (last, _) = files.last().unwrap();
         assert!(!dir.join(last).exists(), "создан файл, в который ничего не писалось");
+
+        // Так файл открывает загрузчик Windows при запуске exe: «другим — только чтение».
+        // Пока раздача держит файл открытым на запись, это падает с ошибкой
+        // «процесс не может получить доступ к файлу».
+        const FILE_SHARE_READ: u32 = 1;
+        let open_like_loader = || {
+            OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(dir.join(first))
+        };
+        println!("сразу после загрузки: {:?}", open_like_loader().map(|_| ()));
+        tokio::time::sleep(Duration::from_millis(WRITE_IDLE_MS) + SWEEP_EVERY * 2).await;
+        open_like_loader().expect("файл остался открытым на запись");
 
         session.stop().await;
         let _ = std::fs::remove_dir_all(&dir);

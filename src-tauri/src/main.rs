@@ -95,6 +95,26 @@ impl AppState {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
+        let mut folders = folders;
+        // Раздачи, добавленные до появления folders.json: берём папку из сохранённой
+        // сессии движка, чтобы и они работали через наше хранилище.
+        if let Some(Value::Object(torrents)) =
+            std::fs::read(data_dir.join("session").join("session.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|mut v| v.get_mut("torrents").map(Value::take))
+        {
+            for t in torrents.values() {
+                if let (Some(hash), Some(dir)) = (
+                    t.get("info_hash").and_then(Value::as_str),
+                    t.get("output_folder").and_then(Value::as_str),
+                ) {
+                    folders
+                        .entry(hash.to_lowercase())
+                        .or_insert_with(|| PathBuf::from(dir));
+                }
+            }
+        }
         Self {
             data_dir,
             settings: Mutex::new(settings),
@@ -243,14 +263,17 @@ async fn add(
     // Сообщаем хранилищу папку заранее: по ней оно создаёт файлы только при записи.
     if let (Some(hash), Some(dir)) = (&info_hash, &output_folder) {
         let known = core.api.session().get(TorrentIdOrHash::parse(hash).map_err(e)?);
-        if known.is_none() {
-            state
-                .folders
-                .write()
-                .unwrap()
-                .insert(hash.to_lowercase(), PathBuf::from(dir));
-            state.save_folders();
+        if known.is_some() {
+            // Движок молча вернул бы существующую раздачу, проигнорировав новые
+            // папку и набор файлов.
+            return Err("Эта раздача уже есть в списке".into());
         }
+        state
+            .folders
+            .write()
+            .unwrap()
+            .insert(hash.to_lowercase(), PathBuf::from(dir));
+        state.save_folders();
     }
 
     let opts = AddTorrentOptions {
@@ -275,7 +298,19 @@ fn sanitize(name: &str) -> String {
         })
         .collect();
     let s = s.trim().trim_end_matches('.').to_string();
-    if s.is_empty() { "torrent".into() } else { s }
+    // Имена устройств Windows (CON, NUL, COM1…) нельзя использовать как имя папки.
+    let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.ends_with(|c: char| c.is_ascii_digit()));
+    if s.is_empty() {
+        "torrent".into()
+    } else if reserved {
+        format!("_{s}")
+    } else {
+        s
+    }
 }
 
 #[tauri::command]
@@ -325,18 +360,24 @@ async fn resume(state: State<'_, AppState>, id: usize) -> R<()> {
 async fn remove(state: State<'_, AppState>, id: usize, delete_files: bool) -> R<()> {
     let core = state.core().await?;
     let id = TorrentIdOrHash::Id(id);
-    if let Some(handle) = core.api.session().get(id) {
-        let hash = handle.info_hash().as_string();
-        state.folders.write().unwrap().remove(&hash);
-        state.save_folders();
-    }
+    let hash = core
+        .api
+        .session()
+        .get(id)
+        .map(|h| h.info_hash().as_string());
     if delete_files {
         core.api.api_torrent_action_delete(id).await
     } else {
         core.api.api_torrent_action_forget(id).await
     }
-    .map(|_| ())
-    .map_err(e)
+    .map_err(e)?;
+    // Папку забываем только после успешного удаления: пока раздача в списке,
+    // хранилищу она нужна.
+    if let Some(hash) = hash {
+        state.folders.write().unwrap().remove(&hash);
+        state.save_folders();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -348,6 +389,48 @@ async fn set_files(state: State<'_, AppState>, id: usize, files: Vec<usize>) -> 
         .await
         .map(|_| ())
         .map_err(e)
+}
+
+/// Перепроверка данных на диске: раздача убирается из сессии (вместе с сохранённой
+/// картой частей) и добавляется заново с теми же файлами и папкой — движок при этом
+/// пересчитывает хеши всех частей. Файлы на диске не трогаются.
+#[tauri::command]
+async fn recheck(state: State<'_, AppState>, id: usize) -> R<()> {
+    let core = state.core().await?;
+    let tid = TorrentIdOrHash::Id(id);
+    let handle = core
+        .api
+        .session()
+        .get(tid)
+        .ok_or_else(|| "Раздача не найдена".to_string())?;
+    let bytes = handle
+        .with_metadata(|m| m.torrent_bytes.clone())
+        .map_err(|_| "Метаданные раздачи ещё не получены".to_string())?;
+    let only_files = handle.only_files();
+    let paused = handle.is_paused();
+    let folder = core.api.api_torrent_details(tid).map_err(e)?.output_folder;
+    drop(handle);
+
+    // Раздача сначала убирается из сессии, поэтому заранее отсекаем очевидную причину,
+    // по которой добавить её обратно не получится.
+    if !std::path::Path::new(&folder).is_dir() {
+        return Err(format!("Папка раздачи недоступна: {folder}"));
+    }
+
+    core.api.api_torrent_action_forget(tid).await.map_err(e)?;
+    let opts = AddTorrentOptions {
+        paused,
+        only_files,
+        output_folder: Some(folder),
+        overwrite: true,
+        preferred_id: Some(id),
+        ..Default::default()
+    };
+    core.api
+        .api_add_torrent(AddTorrent::from_bytes(bytes), Some(opts))
+        .await
+        .map(|_| ())
+        .map_err(|err| format!("Раздача убрана из списка, но добавить её заново не удалось: {}", e(err)))
 }
 
 #[tauri::command]
@@ -538,7 +621,21 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main(app),
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        // Даём движку корректно остановиться (сохранить состояние,
+                        // закрыть соединения), но не дольше пяти секунд.
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(core) = app.try_state::<AppState>().and_then(|s| s.core.get().map(|c| c.api.clone())) {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    core.session().stop(),
+                                )
+                                .await;
+                            }
+                            app.exit(0);
+                        });
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -567,6 +664,7 @@ fn main() {
             resume,
             remove,
             set_files,
+            recheck,
             set_limits,
             set_download_dir,
             pick_torrent_file,

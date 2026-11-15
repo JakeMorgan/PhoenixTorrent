@@ -87,6 +87,7 @@ function makeRow(t) {
     <div class="t-name"></div>
     <div class="t-actions">
       <button class="icon a-toggle"></button>
+      <button class="icon a-recheck" title="Перепроверить данные (пересчитать хеш)">${icon('recheck')}</button>
       <button class="icon a-folder" title="Открыть папку">${icon('folder')}</button>
       <button class="icon danger a-remove" title="Удалить">${icon('trash')}</button>
     </div>
@@ -96,6 +97,15 @@ function makeRow(t) {
   $('.a-toggle', row).addEventListener('click', (ev) => { ev.stopPropagation(); toggle(t.id); });
   $('.a-folder', row).addEventListener('click', (ev) => { ev.stopPropagation(); invoke('open_folder', { id: t.id }).catch(fail); });
   $('.a-remove', row).addEventListener('click', (ev) => { ev.stopPropagation(); askRemove(t.id); });
+  $('.a-recheck', row).addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    try {
+      await invoke('recheck', { id: t.id });
+      toast('Проверка данных запущена');
+      if (state.selected === t.id) select(t.id);
+      tick();
+    } catch (err) { fail(err); }
+  });
   return row;
 }
 
@@ -304,7 +314,15 @@ async function renderDetail(force) {
         const tr = el('tr');
         tr.dataset.i = i;
         const cb = el('input'); cb.type = 'checkbox'; cb.checked = f.included;
-        cb.addEventListener('change', () => { f.included = cb.checked; saveFiles(t.id); });
+        cb.addEventListener('change', () => {
+          if (!cb.checked && !files.some((x) => x !== f && x.included && !x.attributes?.padding)) {
+            cb.checked = true;
+            fail('Нужно оставить хотя бы один файл');
+            return;
+          }
+          f.included = cb.checked;
+          saveFiles(t.id);
+        });
         const td0 = el('td'); td0.append(cb);
         tr.append(td0, el('td', 'name', f.name), el('td', 'num', fmtBytes(f.length)));
         const tdBar = el('td'); tdBar.innerHTML = '<div class="bar"><i></i></div>';
@@ -416,6 +434,7 @@ document.addEventListener('keydown', (ev) => {
 
 // ---------- Добавление ----------
 let pending = null; // результат preview
+let previewSeq = 0; // номер последнего запроса preview: ответы на более ранние отбрасываются
 function showError(id, err) {
   const box = $('#' + id);
   box.textContent = err ? String(err) : '';
@@ -428,6 +447,7 @@ function setBusy(btn, busy, label) {
 
 function openAdd(source) {
   pending = null;
+  previewSeq++;
   $('#add-source').value = source || '';
   $('#add-step1').classList.remove('hidden');
   $('#add-step2').classList.add('hidden');
@@ -444,9 +464,10 @@ async function loadPreview() {
   const btn = $('#add-next');
   showError('add-error');
   setBusy(btn, true, source.startsWith('magnet:') ? 'Поиск пиров…' : 'Чтение…');
+  const seq = ++previewSeq;
   try {
     const res = await invoke('preview', { source });
-    if ($('#m-add').classList.contains('hidden')) return;
+    if (seq !== previewSeq || $('#m-add').classList.contains('hidden')) return;
     pending = { source, res };
     const files = res.details.files || [];
     const total = files.reduce((a, f) => a + f.length, 0);
@@ -471,6 +492,7 @@ async function loadPreview() {
     $('#add-step2').classList.remove('hidden');
     setBusy(btn, false, 'Скачать');
   } catch (err) {
+    if (seq !== previewSeq) return;
     showError('add-error', err);
     setBusy(btn, false, 'Далее');
   }
@@ -535,7 +557,8 @@ $('#add-all').addEventListener('change', (ev) => {
 document.addEventListener('paste', (ev) => {
   if (ev.target instanceof HTMLInputElement) return;
   const text = (ev.clipboardData?.getData('text') || '').trim();
-  if (/^(magnet:|https?:\/\/)/i.test(text)) openAdd(text);
+  // Только то, что похоже на раздачу: случайная ссылка из буфера не должна скачиваться.
+  if (/^magnet:/i.test(text) || /^https?:\/\/\S+\.torrent(\?\S*)?$/i.test(text)) openAdd(text);
 });
 
 // Перетаскивание .torrent-файлов.
@@ -543,8 +566,10 @@ listen('tauri://drag-enter', () => $('#drop').classList.remove('hidden'));
 listen('tauri://drag-leave', () => $('#drop').classList.add('hidden'));
 listen('tauri://drag-drop', (ev) => {
   $('#drop').classList.add('hidden');
-  const file = (ev.payload?.paths || []).find((p) => p.toLowerCase().endsWith('.torrent'));
-  if (file) openAdd(file); else toast('Это не .torrent-файл', true);
+  const files = (ev.payload?.paths || []).filter((p) => p.toLowerCase().endsWith('.torrent'));
+  if (!files.length) { toast('Это не .torrent-файл', true); return; }
+  openAdd(files[0]);
+  if (files.length > 1) toast(`Открыт первый файл из ${files.length} — остальные добавьте по одному`);
 });
 
 // ---------- Настройки ----------
