@@ -502,6 +502,8 @@ async function confirmAdd() {
       multi: (pending.res.details.files || []).length > 1,
       paused: $('#add-paused').checked,
       peers: pending.res.seen_peers || null,
+      infoHash: pending.res.details.info_hash || null,
+      defaultFolder: pending.res.output_folder || null,
     });
     const folder = $('#add-folder').value.trim();
     if ($('#add-remember').checked && folder) await invoke('set_download_dir', { dir: folder }).catch(fail);

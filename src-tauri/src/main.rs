@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod lazy_storage;
+
 use std::{
     collections::HashSet,
     net::{Ipv6Addr, SocketAddr},
@@ -13,6 +15,7 @@ use librqbit::{
     api::{ApiTorrentListOpts, TorrentIdOrHash},
     dht::DhtPersistenceConfig,
     limits::LimitsConfig,
+    storage::StorageFactoryExt,
     AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, ListenerMode, ListenerOptions, Session,
     SessionOptions, SessionPersistenceConfig,
 };
@@ -77,6 +80,8 @@ struct AppState {
     data_dir: PathBuf,
     settings: Mutex<Settings>,
     core: OnceCell<Core>,
+    /// info hash -> папка раздачи, для хранилища с отложенным созданием файлов.
+    folders: lazy_storage::Folders,
 }
 
 impl AppState {
@@ -85,10 +90,24 @@ impl AppState {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let folders: std::collections::HashMap<String, PathBuf> =
+            std::fs::read(data_dir.join("folders.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
         Self {
             data_dir,
             settings: Mutex::new(settings),
             core: OnceCell::new(),
+            folders: std::sync::Arc::new(std::sync::RwLock::new(folders)),
+        }
+    }
+
+    fn save_folders(&self) {
+        let map = self.folders.read().unwrap().clone();
+        if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+            let _ = std::fs::create_dir_all(&self.data_dir);
+            let _ = std::fs::write(self.data_dir.join("folders.json"), bytes);
         }
     }
 
@@ -118,6 +137,12 @@ impl AppState {
 
         let opts = |port: u16| SessionOptions {
             fastresume: true,
+            default_storage_factory: Some(
+                lazy_storage::LazyFsFactory {
+                    folders: self.folders.clone(),
+                }
+                .boxed(),
+            ),
             persistence: Some(SessionPersistenceConfig::Json {
                 folder: Some(self.data_dir.join("session")),
             }),
@@ -196,6 +221,8 @@ async fn add(
     multi: bool,
     paused: bool,
     peers: Option<Vec<SocketAddr>>,
+    info_hash: Option<String>,
+    default_folder: Option<String>,
 ) -> R<Value> {
     let core = state.core().await?;
     let add = AddTorrent::from_cli_argument(source.trim()).map_err(e)?;
@@ -209,7 +236,22 @@ async fn add(
             (Some(n), true) => f.join(sanitize(n)),
             _ => f,
         })
-        .map(|f| f.to_string_lossy().into_owned());
+        .map(|f| f.to_string_lossy().into_owned())
+        // Иначе — папка, которую движок сам предложил при предпросмотре.
+        .or(default_folder);
+
+    // Сообщаем хранилищу папку заранее: по ней оно создаёт файлы только при записи.
+    if let (Some(hash), Some(dir)) = (&info_hash, &output_folder) {
+        let known = core.api.session().get(TorrentIdOrHash::parse(hash).map_err(e)?);
+        if known.is_none() {
+            state
+                .folders
+                .write()
+                .unwrap()
+                .insert(hash.to_lowercase(), PathBuf::from(dir));
+            state.save_folders();
+        }
+    }
 
     let opts = AddTorrentOptions {
         paused,
@@ -283,6 +325,11 @@ async fn resume(state: State<'_, AppState>, id: usize) -> R<()> {
 async fn remove(state: State<'_, AppState>, id: usize, delete_files: bool) -> R<()> {
     let core = state.core().await?;
     let id = TorrentIdOrHash::Id(id);
+    if let Some(handle) = core.api.session().get(id) {
+        let hash = handle.info_hash().as_string();
+        state.folders.write().unwrap().remove(&hash);
+        state.save_folders();
+    }
     if delete_files {
         core.api.api_torrent_action_delete(id).await
     } else {

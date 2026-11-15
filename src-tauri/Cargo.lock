@@ -3678,6 +3678,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tokio",
+ "windows",
  "winreg 0.55.0",
 ]
 
